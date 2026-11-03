@@ -36,6 +36,9 @@ export const api = {
   }),
   simulateEmailIngestion: (payload) => apiClient.post('/invoices/invoices/email-ingestion/', payload || {}),
   editInvoiceField: (invoiceId, payload) => apiClient.post(`/invoices/invoices/${invoiceId}/edit-field/`, payload),
+  deleteLineItem: (invoiceId, itemId, reason) => apiClient.post(`/invoices/invoices/${invoiceId}/delete-item/`, { item_id: itemId, reason }),
+  editLineItem: (invoiceId, payload) => apiClient.post(`/invoices/invoices/${invoiceId}/edit-item/`, payload),
+  addLineItem: (invoiceId, payload) => apiClient.post(`/invoices/invoices/${invoiceId}/add-item/`, payload),
   apApproveChanges: (invoiceId, notes) => apiClient.post(`/invoices/invoices/${invoiceId}/ap-approve-changes/`, { notes }),
 
   // Matching

@@ -22,6 +22,15 @@ export default function PaymentProcessing() {
   const [paymentMode, setPaymentMode] = useState('NEFT');
   const [submitting, setSubmitting] = useState(false);
 
+  const getCurrencySymbol = (curr) => {
+    if (!curr) return '₹';
+    const c = curr.toString().toUpperCase().trim();
+    if (c === 'USD' || c === '$') return '$';
+    if (c === 'EUR' || c === '€') return '€';
+    if (c === 'GBP' || c === '£') return '£';
+    return '₹';
+  };
+
   useEffect(() => {
     loadPayments();
   }, []);
@@ -145,9 +154,9 @@ export default function PaymentProcessing() {
                 <th className="py-3 px-4 font-semibold">Payment Ref / Invoice #</th>
                 <th className="py-3 px-4 font-semibold">Beneficiary Supplier</th>
                 <th className="py-3 px-4 font-semibold">Bank Details (Masked)</th>
-                <th className="py-3 px-4 font-semibold text-right">Gross (₹)</th>
+                <th className="py-3 px-4 font-semibold text-right">Gross Amount</th>
                 <th className="py-3 px-4 font-semibold text-right">TDS u/s 194Q</th>
-                <th className="py-3 px-4 font-semibold text-right">Net Payable (₹)</th>
+                <th className="py-3 px-4 font-semibold text-right">Net Payable</th>
                 <th className="py-3 px-4 font-semibold text-center">Settlement Status</th>
                 <th className="py-3 px-4 font-semibold text-right">Actions</th>
               </tr>
@@ -162,7 +171,9 @@ export default function PaymentProcessing() {
                   <td colSpan={8} className="py-8 text-center text-slate-400">No payment records found.</td>
                 </tr>
               ) : (
-                payments.map((p) => (
+                payments.map((p) => {
+                  const sym = getCurrencySymbol(p.currency);
+                  return (
                   <tr key={p.id} className="hover:bg-slate-50">
                     <td className="py-3 px-4">
                       <div className="font-mono font-bold text-indigo-700">{p.invoice_number}</div>
@@ -174,13 +185,13 @@ export default function PaymentProcessing() {
                       <div className="text-[10px] text-slate-500 font-bold">{p.bank_account_masked}</div>
                     </td>
                     <td className="py-3 px-4 font-mono text-right text-slate-600">
-                      ₹{parseFloat(p.gross_amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                      {sym}{parseFloat(p.gross_amount).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
                     <td className="py-3 px-4 font-mono text-right text-rose-600">
-                      -₹{parseFloat(p.tds_amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                      -{sym}{parseFloat(p.tds_amount).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
                     <td className="py-3 px-4 font-mono font-bold text-right text-slate-900">
-                      ₹{parseFloat(p.net_payable_amount).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                      {sym}{parseFloat(p.net_payable_amount).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
                     <td className="py-3 px-4 text-center">
                       <div>{getStatusBadge(p.status)}</div>
@@ -230,7 +241,8 @@ export default function PaymentProcessing() {
                       )}
                     </td>
                   </tr>
-                ))
+                );
+              })
               )}
             </tbody>
           </table>
@@ -261,7 +273,7 @@ export default function PaymentProcessing() {
                   >
                     {approvedInvoices.map((inv) => (
                       <option key={inv.id} value={inv.id}>
-                        {inv.invoice_number} – {inv.vendor_details?.name} (₹{parseFloat(inv.grand_total).toLocaleString('en-IN')})
+                        {inv.invoice_number} – {inv.vendor_details?.name} ({getCurrencySymbol(inv.currency)}{parseFloat(inv.grand_total).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })})
                       </option>
                     ))}
                   </select>

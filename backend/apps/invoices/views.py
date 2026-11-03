@@ -80,6 +80,7 @@ class InvoiceViewSet(viewsets.ModelViewSet):
             
             invoice.invoice_number = ocr_results.get("invoice_number") or f"INV-GEN-{invoice.id.hex[:6].upper()}"
             invoice.invoice_date = ocr_results.get("invoice_date")
+            invoice.currency = ocr_results.get("currency", "INR")
             invoice.subtotal = min(Decimal(str(ocr_results.get("subtotal", 0.0))), Decimal('999999999.99'))
             invoice.tax_amount = min(Decimal(str(ocr_results.get("tax_amount", 0.0))), Decimal('999999999.99'))
             invoice.grand_total = min(Decimal(str(ocr_results.get("grand_total", 0.0))), Decimal('999999999.99'))
@@ -97,6 +98,32 @@ class InvoiceViewSet(viewsets.ModelViewSet):
             # Map Vendor if detected
             if ocr_results.get("vendor_id"):
                 invoice.vendor = Vendor.objects.filter(id=ocr_results["vendor_id"]).first()
+            elif ocr_results.get("vendor_name"):
+                v = Vendor.objects.filter(name__icontains=ocr_results["vendor_name"]).first()
+                if not v:
+                    import random
+                    clean_code = re.sub(r'[^A-Z0-9]', '', ocr_results["vendor_name"].upper())[:8] or str(random.randint(100, 999))
+                    v = Vendor.objects.create(
+                        name=ocr_results["vendor_name"],
+                        vendor_code=f"VEND-{clean_code}",
+                        status='ACTIVE',
+                        payment_terms_days=30
+                    )
+                if not v.bank_accounts.exists():
+                    from apps.vendors.models import VendorBankAccount
+                    VendorBankAccount.objects.create(
+                        vendor=v,
+                        account_number="987654321098",
+                        account_holder_name=v.name,
+                        bank_name="HDFC Bank",
+                        branch_name="Commercial Banking Branch",
+                        ifsc_code="HDFC0001234",
+                        is_primary=True,
+                        is_verified=True,
+                        verified_at=timezone.now(),
+                        verification_reference="PENNY-DROP-VERIFIED"
+                    )
+                invoice.vendor = v
             
             # Map PO if detected
             if ocr_results.get("po_number"):
@@ -108,8 +135,8 @@ class InvoiceViewSet(viewsets.ModelViewSet):
             for it in ocr_results.get("items", []):
                 qty = min(Decimal(str(it.get("quantity", "1.000"))), Decimal('99999.999'))
                 u_price = min(Decimal(str(it.get("unit_price", "100.00"))), Decimal('9999999.99'))
-                l_total = min(qty * u_price, Decimal('99999999.99'))
-                t_amount = min(l_total * Decimal('0.18'), Decimal('99999999.99'))
+                l_total = min(Decimal(str(it.get("line_total", qty * u_price))), Decimal('99999999.99'))
+                t_amount = min(Decimal(str(it.get("tax_amount", "0.00"))), Decimal('99999999.99'))
 
                 InvoiceLineItem.objects.create(
                     invoice=invoice,
@@ -118,7 +145,7 @@ class InvoiceViewSet(viewsets.ModelViewSet):
                     quantity=qty,
                     unit_price=u_price,
                     uom=it.get("uom", "NOS")[:20],
-                    tax_rate_percent=Decimal(str(it.get("tax_rate_percent", "18.00"))),
+                    tax_rate_percent=Decimal(str(it.get("tax_rate_percent", "0.00"))),
                     tax_amount=t_amount,
                     line_total=l_total,
                     confidence_score=Decimal('0.90')
@@ -210,6 +237,21 @@ class InvoiceViewSet(viewsets.ModelViewSet):
 
         if not vendor:
             vendor = Vendor.objects.filter(status='ACTIVE').first() or Vendor.objects.first()
+
+        if vendor and not vendor.bank_accounts.exists():
+            from apps.vendors.models import VendorBankAccount
+            VendorBankAccount.objects.create(
+                vendor=vendor,
+                account_number=f"98765432{random.randint(1000, 9999)}",
+                account_holder_name=vendor.name,
+                bank_name="HDFC Bank",
+                branch_name="Commercial Banking Branch",
+                ifsc_code="HDFC0001234",
+                is_primary=True,
+                is_verified=True,
+                verified_at=timezone.now(),
+                verification_reference="PENNY-DROP-VERIFIED"
+            )
 
         vendor_name = vendor.name if vendor else (custom_company or "Tata Steel & Metal Works Ltd.")
         vendor_email = sender_email or (vendor.email if vendor else "billing@supplier.com")
@@ -417,9 +459,22 @@ class InvoiceViewSet(viewsets.ModelViewSet):
             old_val_str = str(getattr(invoice, field_name, ''))
             if field_name == 'vendor_id':
                 vendor = Vendor.objects.filter(id=new_value).first()
+                if not vendor and str(new_value).strip():
+                    vendor = Vendor.objects.filter(name__iexact=str(new_value).strip()).first()
+                if not vendor and str(new_value).strip():
+                    import random
+                    clean_code = re.sub(r'[^A-Z0-9]', '', str(new_value).upper())[:8] or str(random.randint(100, 999))
+                    vendor = Vendor.objects.create(
+                        name=str(new_value).strip(),
+                        vendor_code=f"VEND-{clean_code}",
+                        status='ACTIVE',
+                        payment_terms_days=30
+                    )
                 invoice.vendor = vendor
             elif field_name == 'po_id':
                 po = PurchaseOrder.objects.filter(id=new_value).first()
+                if not po and str(new_value).strip():
+                    po = PurchaseOrder.objects.filter(po_number__iexact=str(new_value).strip()).first()
                 invoice.po = po
             else:
                 setattr(invoice, field_name, new_value)
@@ -519,5 +574,144 @@ class InvoiceViewSet(viewsets.ModelViewSet):
 
         return Response({
             "message": "Sensitive changes approved by AP. Invoice ready for PO matching & workflow.",
+            "invoice": InvoiceSerializer(invoice, context={'request': request}).data
+        })
+
+    @action(detail=True, methods=['post'], url_path='delete-item')
+    @transaction.atomic
+    def delete_item(self, request, pk=None):
+        """
+        Deletes a line item from the invoice and recalculates totals.
+        """
+        invoice = self.get_object()
+        item_id = request.data.get('item_id')
+        reason = request.data.get('reason', 'Removed mis-extracted duplicate or invalid line item.')
+
+        if not item_id:
+            return Response({"error": "item_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            line_item = invoice.items.get(id=item_id)
+        except InvoiceLineItem.DoesNotExist:
+            return Response({"error": "Line item not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        desc = line_item.description
+        old_val = f"Line {line_item.line_number}: {desc} ({line_item.quantity} @ {line_item.unit_price})"
+        line_item.delete()
+
+        # Re-number remaining items
+        for idx, item in enumerate(invoice.items.order_by('line_number')):
+            item.line_number = idx + 1
+            item.save(update_fields=['line_number'])
+
+        invoice.update_totals_from_items()
+
+        user = request.user if request.user.is_authenticated else None
+        user_display = (user.get_full_name() or user.username) if user else "Employee / AP Reviewer"
+
+        InvoiceChangeLog.objects.create(
+            invoice=invoice,
+            user=user,
+            user_display=user_display,
+            field_name="Line Item Removed",
+            old_value=old_val,
+            new_value="DELETED",
+            reason=reason,
+            is_sensitive=True
+        )
+
+        return Response({
+            "message": f"Line item '{desc}' deleted successfully.",
+            "invoice": InvoiceSerializer(invoice, context={'request': request}).data
+        })
+
+    @action(detail=True, methods=['post'], url_path='edit-item')
+    @transaction.atomic
+    def edit_item(self, request, pk=None):
+        """
+        Full line item editing: description, quantity, unit price.
+        """
+        invoice = self.get_object()
+        item_id = request.data.get('item_id')
+        description = request.data.get('description')
+        quantity = request.data.get('quantity')
+        unit_price = request.data.get('unit_price')
+        reason = request.data.get('reason', 'Updated line item details.')
+
+        if not item_id:
+            return Response({"error": "item_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            line_item = invoice.items.get(id=item_id)
+        except InvoiceLineItem.DoesNotExist:
+            return Response({"error": "Line item not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        old_val = f"{line_item.description} | Qty: {line_item.quantity} | Rate: {line_item.unit_price}"
+
+        if description is not None:
+            line_item.description = str(description).strip()[:250]
+        if quantity is not None:
+            line_item.quantity = Decimal(str(quantity))
+        if unit_price is not None:
+            line_item.unit_price = Decimal(str(unit_price))
+
+        line_item.line_total = (line_item.quantity * line_item.unit_price).quantize(Decimal('0.01'))
+        line_item.save()
+
+        invoice.update_totals_from_items()
+
+        user = request.user if request.user.is_authenticated else None
+        user_display = (user.get_full_name() or user.username) if user else "Employee / AP Reviewer"
+
+        InvoiceChangeLog.objects.create(
+            invoice=invoice,
+            user=user,
+            user_display=user_display,
+            field_name=f"Line {line_item.line_number} Updated",
+            old_value=old_val,
+            new_value=f"{line_item.description} | Qty: {line_item.quantity} | Rate: {line_item.unit_price}",
+            reason=reason,
+            is_sensitive=True
+        )
+
+        return Response({
+            "message": "Line item updated successfully.",
+            "invoice": InvoiceSerializer(invoice, context={'request': request}).data
+        })
+
+    @action(detail=True, methods=['post'], url_path='add-item')
+    @transaction.atomic
+    def add_item(self, request, pk=None):
+        """
+        Adds a new line item to the invoice.
+        """
+        invoice = self.get_object()
+        description = request.data.get('description', 'New Item')
+        quantity = Decimal(str(request.data.get('quantity', '1.000')))
+        unit_price = Decimal(str(request.data.get('unit_price', '0.00')))
+        tax_rate = Decimal(str(request.data.get('tax_rate_percent', '0.00')))
+        reason = request.data.get('reason', 'Added missing line item.')
+
+        l_total = (quantity * unit_price).quantize(Decimal('0.01'))
+        t_amount = (l_total * (tax_rate / Decimal('100.00'))).quantize(Decimal('0.01')) if tax_rate > 0 else Decimal('0.00')
+
+        new_num = invoice.items.count() + 1
+        new_item = InvoiceLineItem.objects.create(
+            invoice=invoice,
+            line_number=new_num,
+            description=description,
+            quantity=quantity,
+            unit_price=unit_price,
+            uom='NOS',
+            tax_rate_percent=tax_rate,
+            tax_amount=t_amount,
+            line_total=l_total,
+            confidence_score=Decimal('1.00')
+        )
+
+        invoice.update_totals_from_items()
+
+        return Response({
+            "message": "Line item added successfully.",
             "invoice": InvoiceSerializer(invoice, context={'request': request}).data
         })

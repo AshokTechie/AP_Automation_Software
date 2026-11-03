@@ -9,6 +9,7 @@ backend/.env
 backend/staticfiles/
 backend/media/invoices/*
 backend/media/imports/*
+backend/media/payment_advices/*
 !backend/media/payment_advices/.gitkeep
 
 # Node & Frontend

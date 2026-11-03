@@ -1,91 +1,161 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../services/api';
 import {
-  ScanEye,
+  FileText,
   CheckCircle2,
   AlertTriangle,
   Edit3,
   History,
-  ShieldCheck,
   ShieldAlert,
-  ArrowRight,
-  ZoomIn,
-  ZoomOut,
-  FileText,
-  RefreshCw
+  ArrowLeft,
+  ExternalLink,
+  RefreshCw,
+  GitCompare,
+  Plus,
+  Trash2,
+  DollarSign
 } from 'lucide-react';
 
-export default function OCRReview({ invoiceId, onBackToList, onNavigateToMatching }) {
-  const [selectedId, setSelectedId] = useState(invoiceId || null);
-  const [invoices, setInvoices] = useState([]);
+export default function OCRReview({ invoiceId, onBackToList }) {
   const [invoice, setInvoice] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [editModal, setEditModal] = useState({ open: false, field_name: '', old_value: '', item_id: null });
+  const [viewerMode, setViewerMode] = useState('pdf'); // 'pdf' | 'preview'
+  const [vendors, setVendors] = useState([]);
+  const [purchaseOrders, setPurchaseOrders] = useState([]);
+
+  // 3-Way Matching state embedded directly in the bill review
+  const [matchingResult, setMatchingResult] = useState(null);
+  const [matchingLoading, setMatchingLoading] = useState(false);
+  const [showOverrideModal, setShowOverrideModal] = useState(false);
+  const [overrideReason, setOverrideReason] = useState('');
+
+  // General Field Edit Modal State (Vendor, Currency, Invoice #, Date, PO)
+  const [editModal, setEditModal] = useState({ open: false, field_name: '', old_value: '', label: '' });
   const [editValue, setEditValue] = useState('');
   const [editReason, setEditReason] = useState('');
   const [submittingEdit, setSubmittingEdit] = useState(false);
-  const [activeTab, setActiveTab] = useState('fields'); // 'fields' | 'history'
-  const [apNotes, setApNotes] = useState('');
+  const [showHistoryModal, setShowHistoryModal] = useState(false);
 
-  const SENSITIVE_FIELDS = [
-    'vendor_id',
-    'invoice_number',
-    'quantity',
-    'unit_price',
-    'tax_rate_percent',
-    'tax_amount',
-    'grand_total',
-    'po_id'
-  ];
+  // Line Item Edit & Create Modal State
+  const [itemModal, setItemModal] = useState({
+    open: false,
+    isNew: false,
+    item_id: null,
+    description: '',
+    quantity: '1.000',
+    unit_price: '0.00'
+  });
+  const [submittingItem, setSubmittingItem] = useState(false);
 
-  // Always fetch latest invoices and select the target or newest invoice
   useEffect(() => {
-    loadInvoicesList(invoiceId);
+    if (invoiceId) {
+      loadInvoiceDetails(invoiceId);
+    } else {
+      loadLatestInvoice();
+    }
+    loadMasterData();
   }, [invoiceId]);
 
-  const loadInvoicesList = async (targetId) => {
+  const loadLatestInvoice = async () => {
     try {
       setLoading(true);
       const res = await api.getInvoices();
       const list = res.data.results ? res.data.results : res.data;
-      const invList = Array.isArray(list) ? list : [];
-      setInvoices(invList);
-
-      // Select targetId (e.g. newly uploaded/ingested invoice), or the newest invoice in the list
-      const toSelect = targetId || (invList.length > 0 ? invList[0].id : null);
-      if (toSelect) {
-        setSelectedId(toSelect);
-        await loadInvoiceDetails(toSelect);
+      if (Array.isArray(list) && list.length > 0) {
+        await loadInvoiceDetails(list[0].id);
       } else {
+        setInvoice(null);
         setLoading(false);
       }
     } catch (err) {
-      console.error('Failed to load invoices list', err);
+      setError('Failed to load invoice');
       setLoading(false);
     }
   };
 
-  const loadInvoiceDetails = async (id) => {
-    if (!id) {
-      setLoading(false);
-      return;
+  const loadMasterData = async () => {
+    try {
+      const [vRes, pRes] = await Promise.all([
+        api.getVendors().catch(() => ({ data: [] })),
+        api.getPurchaseOrders().catch(() => ({ data: [] }))
+      ]);
+      setVendors(Array.isArray(vRes.data?.results) ? vRes.data.results : (Array.isArray(vRes.data) ? vRes.data : []));
+      setPurchaseOrders(Array.isArray(pRes.data?.results) ? pRes.data.results : (Array.isArray(pRes.data) ? pRes.data : []));
+    } catch (e) {
+      console.warn('Could not fetch master data', e);
     }
+  };
+
+  const loadInvoiceDetails = async (id) => {
+    if (!id) return;
     try {
       setLoading(true);
       setError(null);
       const res = await api.getInvoice(id);
       setInvoice(res.data);
+      if (res.data.file_url) {
+        setViewerMode('pdf');
+      } else {
+        setViewerMode('preview');
+      }
+
+      // Automatically evaluate match if invoice has a linked PO
+      if (res.data.po) {
+        runMatchEvaluation(id);
+      } else {
+        setMatchingResult(null);
+      }
     } catch (err) {
-      console.error('Failed to load invoice details', err);
       setError(err.response?.data?.error || err.message || 'Failed to load invoice details');
     } finally {
       setLoading(false);
     }
   };
 
-  const openEditModal = (fieldName, currentValue, itemId = null) => {
-    setEditModal({ open: true, field_name: fieldName, old_value: currentValue, item_id: itemId });
+  const runMatchEvaluation = async (invId = invoice?.id) => {
+    if (!invId) return;
+    try {
+      setMatchingLoading(true);
+      const res = await api.evaluateMatch(invId, 1.0);
+      setMatchingResult(res.data);
+    } catch (err) {
+      console.warn('Matching evaluation error:', err);
+    } finally {
+      setMatchingLoading(false);
+    }
+  };
+
+  const handleOverrideMatch = async (e) => {
+    e.preventDefault();
+    if (!overrideReason.trim()) {
+      alert('Mandatory justification reason is required to authorize variance.');
+      return;
+    }
+    try {
+      await api.overrideMatch(invoice.id, overrideReason);
+      setShowOverrideModal(false);
+      setOverrideReason('');
+      await loadInvoiceDetails(invoice.id);
+      await runMatchEvaluation(invoice.id);
+      alert('Discrepancy authorized! Invoice marked as MATCH_PASSED.');
+    } catch (err) {
+      alert(err.response?.data?.error || 'Override failed');
+    }
+  };
+
+  const handleRouteToApproval = async () => {
+    try {
+      await api.initiateApproval(invoice.id);
+      alert('Invoice successfully routed to the Manager Approval Matrix!');
+      await loadInvoiceDetails(invoice.id);
+    } catch (err) {
+      alert(err.response?.data?.error || 'Could not initiate approval');
+    }
+  };
+
+  const openEditModal = (fieldName, currentValue, label) => {
+    setEditModal({ open: true, field_name: fieldName, old_value: currentValue, label: label || fieldName });
     setEditValue(currentValue != null ? String(currentValue) : '');
     setEditReason('');
   };
@@ -93,7 +163,7 @@ export default function OCRReview({ invoiceId, onBackToList, onNavigateToMatchin
   const handleSaveEdit = async (e) => {
     e.preventDefault();
     if (!editReason.trim()) {
-      alert('Mandatory explanation reason is required for every edit (Templegate Rule 3).');
+      alert('Mandatory explanation reason is required for every edit.');
       return;
     }
 
@@ -102,12 +172,10 @@ export default function OCRReview({ invoiceId, onBackToList, onNavigateToMatchin
       await api.editInvoiceField(invoice.id, {
         field_name: editModal.field_name,
         new_value: editValue,
-        reason: editReason,
-        item_id: editModal.item_id
+        reason: editReason
       });
-      setEditModal({ open: false, field_name: '', old_value: '', item_id: null });
+      setEditModal({ open: false, field_name: '', old_value: '', label: '' });
       await loadInvoiceDetails(invoice.id);
-      alert('Field updated successfully and logged in immutable change history.');
     } catch (err) {
       alert(err.response?.data?.error || 'Failed to update field');
     } finally {
@@ -115,13 +183,87 @@ export default function OCRReview({ invoiceId, onBackToList, onNavigateToMatchin
     }
   };
 
-  const handleAPApprove = async () => {
+  // Line Item Management Handlers
+  const openItemEditModal = (item) => {
+    setItemModal({
+      open: true,
+      isNew: false,
+      item_id: item.id,
+      description: item.description,
+      quantity: String(parseFloat(item.quantity || 1)),
+      unit_price: String(parseFloat(item.unit_price || 0))
+    });
+  };
+
+  const openAddItemModal = () => {
+    setItemModal({
+      open: true,
+      isNew: true,
+      item_id: null,
+      description: '',
+      quantity: '1.000',
+      unit_price: '0.00'
+    });
+  };
+
+  const handleSaveItem = async (e) => {
+    e.preventDefault();
+    if (!itemModal.description.trim()) {
+      alert('Item description is required.');
+      return;
+    }
+
     try {
-      await api.apApproveChanges(invoice.id, apNotes || 'AP specialist reviewed source document and confirmed edits.');
+      setSubmittingItem(true);
+      if (itemModal.isNew) {
+        await api.addLineItem(invoice.id, {
+          description: itemModal.description.trim(),
+          quantity: itemModal.quantity,
+          unit_price: itemModal.unit_price,
+          reason: 'Added missing line item to invoice.'
+        });
+      } else {
+        await api.editLineItem(invoice.id, {
+          item_id: itemModal.item_id,
+          description: itemModal.description.trim(),
+          quantity: itemModal.quantity,
+          unit_price: itemModal.unit_price,
+          reason: 'Corrected line item description / quantity / unit price.'
+        });
+      }
+      setItemModal({ open: false, isNew: false, item_id: null, description: '', quantity: '1.000', unit_price: '0.00' });
       await loadInvoiceDetails(invoice.id);
-      alert('Sensitive edits verified and approved by AP Specialist!');
     } catch (err) {
-      alert(err.response?.data?.error || 'Failed to approve changes');
+      alert(err.response?.data?.error || 'Failed to save line item');
+    } finally {
+      setSubmittingItem(false);
+    }
+  };
+
+  const handleDeleteItem = async (itemId, desc) => {
+    if (!window.confirm(`Are you sure you want to delete this line item?\n\n"${desc || 'Item'}"`)) {
+      return;
+    }
+
+    try {
+      await api.deleteLineItem(invoice.id, itemId, `Removed redundant or mis-extracted line item: ${desc}`);
+      await loadInvoiceDetails(invoice.id);
+    } catch (err) {
+      alert(err.response?.data?.error || 'Failed to delete line item');
+    }
+  };
+
+  // Helper for dynamic currency symbol ($ / € / £ / ₹)
+  const getCurrencySymbol = (curr) => {
+    switch (curr?.toUpperCase()) {
+      case 'USD':
+        return '$';
+      case 'EUR':
+        return '€';
+      case 'GBP':
+        return '£';
+      default:
+        return '₹';
     }
   };
 
@@ -129,433 +271,683 @@ export default function OCRReview({ invoiceId, onBackToList, onNavigateToMatchin
     return (
       <div className="p-16 text-center text-slate-500 space-y-3">
         <RefreshCw className="w-8 h-8 text-indigo-600 animate-spin mx-auto" />
-        <p className="text-sm font-semibold text-slate-700">Loading Side-by-Side OCR Verification Viewer...</p>
-        <p className="text-xs text-slate-400">Fetching extracted metadata and line items</p>
+        <p className="text-sm font-semibold text-slate-700">Loading Bill Workspace...</p>
       </div>
     );
   }
 
-  if (error) {
+  if (error || !invoice) {
     return (
       <div className="p-12 text-center space-y-3 max-w-md mx-auto">
         <AlertTriangle className="w-10 h-10 text-rose-500 mx-auto" />
-        <h3 className="text-sm font-bold text-slate-900">Error Loading Invoice</h3>
-        <p className="text-xs text-rose-600">{error}</p>
-        <div className="flex justify-center space-x-2 pt-2">
-          <button
-            onClick={() => loadInvoiceDetails(selectedId)}
-            className="px-3 py-1.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm"
-          >
-            Retry
-          </button>
-          <button
-            onClick={onBackToList}
-            className="px-3 py-1.5 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg"
-          >
-            Back to Invoices
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  if (!invoice) {
-    return (
-      <div className="p-12 text-center text-slate-500 space-y-3 max-w-md mx-auto">
-        <FileText className="w-10 h-10 text-slate-400 mx-auto" />
-        <p className="text-sm font-semibold text-slate-800">No Invoices Available for OCR Review</p>
-        <p className="text-xs text-slate-400">Please upload an invoice in the Invoice Capture module or check the ledger.</p>
+        <h3 className="text-sm font-bold text-slate-900">Unable to Load Invoice</h3>
+        <p className="text-xs text-rose-600">{error || 'No invoice selected'}</p>
         <button
           onClick={onBackToList}
-          className="mt-3 px-4 py-2 text-xs text-white font-bold bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm"
+          className="mt-2 px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm"
         >
-          ← Go to Invoices Ledger
+          ← Return to Bills Ledger
         </button>
       </div>
     );
   }
 
-  const isSensitiveField = SENSITIVE_FIELDS.includes(editModal.field_name);
+  const sym = getCurrencySymbol(invoice.currency);
   const items = invoice.items || [];
   const changeLogs = invoice.change_logs || [];
   const confidencePct = Math.round(parseFloat(invoice.ocr_confidence_score || 0) * 100);
 
   return (
-    <div className="p-6 space-y-4 max-w-7xl mx-auto">
-      {/* Top Header & Breadcrumbs & Invoice Selector */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-slate-200 gap-3">
-        <div className="flex items-center space-x-3 flex-wrap gap-y-1">
-          <button onClick={onBackToList} className="text-xs font-semibold text-slate-500 hover:text-slate-800">
-            ← Invoices
+    <div className="p-4 lg:p-6 max-w-[1600px] mx-auto space-y-4 font-sans text-slate-800">
+      {/* Zoho-Style Breadcrumbs & Action Bar */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200">
+        <div className="flex items-center space-x-3">
+          <button
+            onClick={onBackToList}
+            className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-semibold text-slate-600 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 shadow-sm"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span>Bills</span>
           </button>
           <span className="text-slate-300">/</span>
-          <h2 className="text-lg font-bold text-slate-900">
-            OCR Verification: {invoice.invoice_number}
-          </h2>
-          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-700">
+          <h1 className="text-base font-bold text-slate-900">
+            Bill #{invoice.invoice_number}
+          </h1>
+          <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold ${
+            invoice.status === 'PAID'
+              ? 'bg-emerald-100 text-emerald-800'
+              : invoice.status === 'PENDING_APPROVAL'
+              ? 'bg-amber-100 text-amber-800'
+              : invoice.status === 'MATCH_PASSED'
+              ? 'bg-blue-100 text-blue-800'
+              : 'bg-slate-100 text-slate-700'
+          }`}>
             {invoice.status_display || invoice.status}
           </span>
         </div>
 
-        <div className="flex items-center space-x-3">
-          {/* Invoice Switcher Dropdown */}
-          <div className="flex items-center space-x-1.5 bg-white p-1 border border-slate-200 rounded-lg shadow-sm">
-            <span className="text-[11px] font-semibold text-slate-500 px-1">Switch:</span>
-            <select
-              value={selectedId || invoice.id}
-              onChange={(e) => {
-                const newId = e.target.value;
-                setSelectedId(newId);
-                loadInvoiceDetails(newId);
-              }}
-              className="text-xs bg-slate-50 border border-slate-200 rounded px-2 py-1 font-bold text-slate-800 focus:outline-none"
+        <div className="flex items-center space-x-2">
+          {changeLogs.length > 0 && (
+            <button
+              onClick={() => setShowHistoryModal(true)}
+              className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 shadow-sm"
             >
-              {invoices.map((inv) => (
-                <option key={inv.id} value={inv.id}>
-                  {inv.invoice_number} ({inv.vendor_details?.name || 'Vendor'} - ₹{parseFloat(inv.grand_total || 0).toLocaleString('en-IN')})
-                </option>
-              ))}
-            </select>
-          </div>
+              <History className="w-3.5 h-3.5 text-slate-500" />
+              <span>Audit Trail ({changeLogs.length})</span>
+            </button>
+          )}
+
+          {invoice.po && (
+            <button
+              onClick={() => runMatchEvaluation(invoice.id)}
+              disabled={matchingLoading}
+              className="flex items-center space-x-1.5 px-3 py-1.5 text-xs font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 shadow-sm"
+            >
+              <GitCompare className="w-3.5 h-3.5" />
+              <span>{matchingLoading ? 'Verifying...' : 'Re-Run 3-Way Match'}</span>
+            </button>
+          )}
 
           <button
-            onClick={() => onNavigateToMatching(invoice.id)}
-            className="px-3 py-1.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm flex items-center space-x-1"
+            onClick={handleRouteToApproval}
+            className="px-4 py-1.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm"
           >
-            <span>Proceed to 3-Way Match</span>
-            <ArrowRight className="w-3.5 h-3.5" />
+            Route for Approval
           </button>
         </div>
       </div>
 
-      {/* Sensitive Edits Warning / AP Action Banner */}
-      {invoice.has_sensitive_edits && (
-        <div className="bg-amber-50 border border-amber-300 rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-sm">
-          <div className="flex items-center space-x-3">
-            <ShieldAlert className="w-5 h-5 text-amber-600 flex-shrink-0" />
-            <div>
-              <h4 className="text-xs font-bold text-amber-900 uppercase">
-                Sensitive Field Edits Detected (Templegate Section 2.3)
-              </h4>
-              <p className="text-xs text-amber-700">
-                A sensitive financial field (quantity, price, or tax) was modified. Invoice is locked for AP Specialist Review before manager approval.
-              </p>
+      {/* Main Split-Screen Workspace (Zoho Books Style) */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        {/* LEFT PANEL: Document Preview (5 of 12 columns) */}
+        <div className="lg:col-span-5 bg-slate-900 rounded-xl p-3 shadow-md flex flex-col h-[820px]">
+          {/* Document Header Toolbar (Clean, NO technical SHA-256 jargon) */}
+          <div className="flex items-center justify-between pb-2.5 border-b border-slate-800 text-xs text-white">
+            <div className="flex items-center space-x-2">
+              <FileText className="w-4 h-4 text-indigo-400" />
+              <span className="font-semibold text-slate-200 text-xs">Original Bill Document</span>
+              <span className="text-[11px] text-emerald-400 font-mono">
+                • {confidencePct}% OCR
+              </span>
+            </div>
+
+            <div className="flex items-center space-x-2">
+              <div className="bg-slate-800 p-0.5 rounded-lg flex text-[10px]">
+                <button
+                  onClick={() => setViewerMode('pdf')}
+                  className={`px-2 py-1 rounded transition-colors ${viewerMode === 'pdf' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400 hover:text-white'}`}
+                >
+                  Document
+                </button>
+                <button
+                  onClick={() => setViewerMode('preview')}
+                  className={`px-2 py-1 rounded transition-colors ${viewerMode === 'preview' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-400 hover:text-white'}`}
+                >
+                  Text Form
+                </button>
+              </div>
+
+              {invoice.file_url && (
+                <a
+                  href={invoice.file_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-indigo-300 hover:text-indigo-100 text-[11px] font-semibold flex items-center space-x-1 bg-indigo-950/60 px-2 py-1 rounded border border-indigo-800/80"
+                  title="Open file in a full browser tab"
+                >
+                  <span>↗ Full View</span>
+                </a>
+              )}
             </div>
           </div>
-          <div className="flex items-center space-x-2">
-            <input
-              type="text"
-              placeholder="AP Review Note..."
-              value={apNotes}
-              onChange={(e) => setApNotes(e.target.value)}
-              className="text-xs bg-white border border-amber-300 rounded-lg px-2.5 py-1.5 focus:outline-none"
-            />
-            <button
-              onClick={handleAPApprove}
-              className="px-3 py-1.5 text-xs font-bold bg-amber-600 text-white rounded-lg hover:bg-amber-700 shadow-sm"
-            >
-              AP Approve Changes
-            </button>
+
+          {/* Document Body */}
+          <div className="flex-1 mt-2.5 bg-slate-950 rounded-lg overflow-hidden border border-slate-800 flex flex-col relative">
+            {viewerMode === 'pdf' && invoice.file_url ? (
+              <div className="w-full h-full bg-white relative">
+                <iframe
+                  src={invoice.file_url}
+                  title="Source PDF"
+                  className="w-full h-full border-0"
+                />
+              </div>
+            ) : (
+              /* Clean Structured Form View */
+              <div className="w-full h-full bg-white text-slate-900 p-6 overflow-y-auto font-sans text-xs">
+                <div className="border-b border-slate-200 pb-4 flex justify-between items-start">
+                  <div>
+                    <h2 className="text-base font-bold text-slate-900">
+                      {invoice.vendor_details?.name || 'SuperStore'}
+                    </h2>
+                    <p className="text-[11px] text-slate-500 mt-0.5">{invoice.vendor_details?.address_line || 'Commercial Supplier'}</p>
+                    {invoice.vendor_details?.gstin && (
+                      <p className="text-[11px] font-mono text-slate-500">GSTIN: {invoice.vendor_details.gstin}</p>
+                    )}
+                  </div>
+                  <div className="text-right">
+                    <span className="text-xs font-bold text-indigo-700 uppercase tracking-wide">TAX INVOICE</span>
+                    <p className="font-mono font-bold text-sm text-slate-900 mt-1">#{invoice.invoice_number}</p>
+                    <p className="text-[11px] text-slate-500">Date: {invoice.invoice_date || 'N/A'}</p>
+                  </div>
+                </div>
+
+                <div className="py-4 text-[11px] border-b border-slate-100 flex justify-between">
+                  <div>
+                    <span className="text-slate-400 font-semibold uppercase text-[10px]">Customer / Billed To:</span>
+                    <p className="font-bold text-slate-800">Aaron Hawkins</p>
+                    <p className="text-slate-500">Templegate Accounts Department</p>
+                  </div>
+                  <div className="text-right">
+                    <span className="text-slate-400 font-semibold uppercase text-[10px]">Linked PO:</span>
+                    <p className="font-mono font-bold text-indigo-700">{invoice.po_details?.po_number || 'Unlinked'}</p>
+                  </div>
+                </div>
+
+                <table className="w-full text-left my-4 text-[11px]">
+                  <thead>
+                    <tr className="border-b border-slate-200 text-slate-500 uppercase text-[10px]">
+                      <th className="py-2">Item</th>
+                      <th className="py-2 text-center">Qty</th>
+                      <th className="py-2 text-right">Rate</th>
+                      <th className="py-2 text-right">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {items.map((it) => (
+                      <tr key={it.id}>
+                        <td className="py-2.5 font-medium text-slate-800 whitespace-pre-line">{it.description}</td>
+                        <td className="py-2.5 text-center font-mono font-semibold">{parseFloat(it.quantity || 0)}</td>
+                        <td className="py-2.5 text-right font-mono">{sym}{parseFloat(it.unit_price || 0).toFixed(2)}</td>
+                        <td className="py-2.5 text-right font-mono font-bold">{sym}{parseFloat(it.line_total || 0).toFixed(2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+
+                <div className="border-t border-slate-200 pt-3 space-y-1.5 text-right text-xs">
+                  <div className="flex justify-between text-slate-600">
+                    <span>Subtotal:</span>
+                    <span className="font-mono font-semibold">{sym}{parseFloat(invoice.subtotal || 0).toFixed(2)}</span>
+                  </div>
+                  <div className="flex justify-between text-slate-600">
+                    <span>Tax / Shipping:</span>
+                    <span className="font-mono font-semibold">{sym}{parseFloat(invoice.tax_amount || 0).toFixed(2)}</span>
+                  </div>
+                  <div className="flex justify-between text-sm font-bold text-slate-900 border-t border-slate-200 pt-2">
+                    <span>Grand Total:</span>
+                    <span className="font-mono text-indigo-700">{sym}{parseFloat(invoice.grand_total || 0).toFixed(2)}</span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
-      )}
 
-      {/* Side-by-Side Split Screen Container */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* LEFT PANE: Document Preview / Raw PDF Evidence */}
-        <div className="lg:col-span-5 bg-slate-900 rounded-2xl p-4 text-white shadow-md flex flex-col h-[750px]">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-800 text-xs">
-            <span className="font-semibold text-slate-300 flex items-center space-x-1.5">
-              <FileText className="w-4 h-4 text-indigo-400" />
-              <span>Source Document Evidence</span>
-            </span>
-            <div className="flex items-center space-x-2 text-[10px] text-slate-400 font-mono">
-              <span>SHA-256: {invoice.file_hash_sha256 ? `${invoice.file_hash_sha256.slice(0, 8)}...` : 'Verified'}</span>
-            </div>
-          </div>
-
-          {/* Visual Document Viewer Box */}
-          <div className="flex-1 bg-slate-950/80 rounded-xl mt-3 p-4 overflow-y-auto border border-slate-800 font-mono text-xs leading-relaxed space-y-3">
-            <div className="bg-white/10 p-2.5 rounded border border-white/10">
-              <span className="text-[10px] text-indigo-300 uppercase font-bold tracking-wide">
-                OCR Bounding Box Overlay (Document Inspection)
-              </span>
-              <p className="text-emerald-400 text-[11px] mt-1 font-semibold">
-                ✓ Document Integrity Verified | OCR Confidence: {confidencePct}%
+        {/* RIGHT PANEL: Zoho Books Editable Bill Form & Integrated 3-Way Match (7 of 12 columns) */}
+        <div className="lg:col-span-7 bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-6 h-[820px] overflow-y-auto">
+          {/* Section 1: Header / Vendor & Currency Details (Zoho Style) */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pb-4 border-b border-slate-100">
+            {/* Vendor Name Field */}
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+              <div className="flex items-center justify-between text-slate-500 text-[11px] font-semibold">
+                <span>VENDOR NAME</span>
+                <button
+                  onClick={() => openEditModal('vendor_id', invoice.vendor, 'Vendor Supplier')}
+                  className="text-indigo-600 hover:text-indigo-800 flex items-center space-x-1"
+                >
+                  <Edit3 className="w-3 h-3" />
+                  <span className="text-[10px]">Change</span>
+                </button>
+              </div>
+              <p className="font-bold text-sm text-slate-900 mt-1">{invoice.vendor_details?.name || 'Unassigned Vendor'}</p>
+              <p className="text-[11px] text-slate-500 font-mono">
+                {invoice.vendor_details?.vendor_code || 'VEND-EXTRACTED'}
               </p>
             </div>
 
-            {/* Simulated Printed Invoice Structure */}
-            <div className="bg-white text-slate-900 p-5 rounded-lg shadow-inner min-h-[500px] text-[11px] font-sans border border-slate-300">
-              <div className="flex justify-between border-b pb-3 border-slate-200">
-                <div>
-                  <h3 className="text-sm font-bold text-slate-900">{invoice.vendor_details?.name || 'VENDOR SUPPLIES LTD.'}</h3>
-                  <p className="text-[10px] text-slate-500">{invoice.vendor_details?.address_line || 'Peenya Industrial Area'}</p>
-                  <p className="text-[10px] text-slate-500 font-mono">GSTIN: {invoice.vendor_details?.gstin || '29AAACT2727Q1ZU'}</p>
-                </div>
-                <div className="text-right">
-                  <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-800 border">TAX INVOICE</span>
-                  <p className="font-mono font-bold mt-1 text-xs">{invoice.invoice_number}</p>
-                  <p className="text-[10px] text-slate-500">Date: {invoice.invoice_date || '2026-10-31'}</p>
-                </div>
+            {/* Currency Selector Field */}
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+              <div className="flex items-center justify-between text-slate-500 text-[11px] font-semibold">
+                <span>BILL CURRENCY</span>
+                <button
+                  onClick={() => openEditModal('currency', invoice.currency, 'Bill Currency')}
+                  className="text-indigo-600 hover:text-indigo-800 flex items-center space-x-1"
+                >
+                  <Edit3 className="w-3 h-3" />
+                  <span className="text-[10px]">Change</span>
+                </button>
               </div>
+              <p className="font-bold text-sm text-indigo-700 mt-1 flex items-center space-x-1">
+                <span>{invoice.currency || 'USD'}</span>
+                <span className="text-slate-400 font-normal">({sym})</span>
+              </p>
+              <p className="text-[11px] text-slate-500">Auto-detected from document symbols</p>
+            </div>
 
-              <div className="my-3 text-[10px] text-slate-600">
-                <span className="font-bold">Billed To:</span> Templegate Technologies & Services Pvt. Ltd.
-                <p>PO Reference: <span className="font-bold font-mono text-indigo-600">{invoice.po_details?.po_number || 'PO-2026-001'}</span></p>
+            {/* Bill Number */}
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+              <div className="flex items-center justify-between text-slate-500 text-[11px] font-semibold">
+                <span>BILL / INVOICE #</span>
+                <button
+                  onClick={() => openEditModal('invoice_number', invoice.invoice_number, 'Invoice Number')}
+                  className="text-indigo-600 hover:text-indigo-800 flex items-center space-x-1"
+                >
+                  <Edit3 className="w-3 h-3" />
+                </button>
               </div>
+              <p className="font-mono font-bold text-sm text-slate-900 mt-1">{invoice.invoice_number}</p>
+            </div>
 
-              {/* Line Items Table in Preview */}
-              <table className="w-full text-left text-[10px] border border-slate-200 my-3">
-                <thead className="bg-slate-100">
+            {/* Bill Date */}
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+              <div className="flex items-center justify-between text-slate-500 text-[11px] font-semibold">
+                <span>BILL DATE</span>
+                <button
+                  onClick={() => openEditModal('invoice_date', invoice.invoice_date, 'Invoice Date')}
+                  className="text-indigo-600 hover:text-indigo-800 flex items-center space-x-1"
+                >
+                  <Edit3 className="w-3 h-3" />
+                </button>
+              </div>
+              <p className="font-bold text-sm text-slate-900 mt-1">{invoice.invoice_date || 'Missing'}</p>
+            </div>
+          </div>
+
+          {/* Section 2: Line Items Table (Zoho Books Grid with Edit + Delete Row) */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wider">
+                Line Items ({items.length})
+              </h3>
+              <button
+                onClick={openAddItemModal}
+                className="flex items-center space-x-1 text-xs font-bold text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 px-2.5 py-1 rounded-lg transition-colors"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Add Line Item</span>
+              </button>
+            </div>
+
+            <div className="border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
                   <tr>
-                    <th className="p-1.5 border-b">Item</th>
-                    <th className="p-1.5 border-b text-center">Qty</th>
-                    <th className="p-1.5 border-b text-right">Rate (₹)</th>
-                    <th className="p-1.5 border-b text-right">Total (₹)</th>
+                    <th className="py-2.5 px-3">Item & Description</th>
+                    <th className="py-2.5 px-3 text-center">Qty</th>
+                    <th className="py-2.5 px-3 text-right">Rate ({sym})</th>
+                    <th className="py-2.5 px-3 text-right">Amount ({sym})</th>
+                    <th className="py-2.5 px-3 text-center">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {items.map((item) => (
-                    <tr key={item.id} className="relative group bg-amber-50/40">
-                      <td className="p-1.5 font-medium">{item.description}</td>
-                      <td className="p-1.5 font-bold font-mono text-center">{parseFloat(item.quantity || 0)}</td>
-                      <td className="p-1.5 font-mono text-right">{parseFloat(item.unit_price || 0).toFixed(2)}</td>
-                      <td className="p-1.5 font-mono text-right font-bold">{parseFloat(item.line_total || 0).toFixed(2)}</td>
+                  {items.map((it) => (
+                    <tr key={it.id} className="hover:bg-slate-50 group">
+                      <td className="py-2.5 px-3 font-medium text-slate-900">
+                        <div className="whitespace-pre-line leading-relaxed">{it.description}</div>
+                        {it.hsn_sac_code && (
+                          <span className="text-[10px] text-slate-400 font-mono">HSN: {it.hsn_sac_code}</span>
+                        )}
+                      </td>
+                      <td className="py-2.5 px-3 text-center font-mono font-bold">
+                        {parseFloat(it.quantity || 0)} {it.uom || ''}
+                      </td>
+                      <td className="py-2.5 px-3 text-right font-mono">
+                        {sym}{parseFloat(it.unit_price || 0).toFixed(2)}
+                      </td>
+                      <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-900">
+                        {sym}{parseFloat(it.line_total || 0).toFixed(2)}
+                      </td>
+                      <td className="py-2.5 px-3 text-center">
+                        <div className="flex items-center justify-center space-x-1">
+                          {/* Edit Item Button */}
+                          <button
+                            onClick={() => openItemEditModal(it)}
+                            className="p-1.5 text-indigo-600 hover:text-indigo-800 rounded hover:bg-indigo-50"
+                            title="Edit this item"
+                          >
+                            <Edit3 className="w-3.5 h-3.5" />
+                          </button>
+                          {/* Delete Item Button (Trash can) */}
+                          <button
+                            onClick={() => handleDeleteItem(it.id, it.description)}
+                            className="p-1.5 text-rose-500 hover:text-rose-700 rounded hover:bg-rose-50"
+                            title="Delete this line row"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </td>
                     </tr>
                   ))}
+                  {items.length === 0 && (
+                    <tr>
+                      <td colSpan={5} className="py-8 text-center text-slate-400 italic">
+                        No line items available. Click "+ Add Line Item" above to add.
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
+            </div>
+          </div>
 
-              <div className="text-right space-y-1 text-[11px] pt-2 border-t border-slate-200">
-                <p>Subtotal: <span className="font-mono">₹{parseFloat(invoice.subtotal || 0).toFixed(2)}</span></p>
-                <p>Tax (GST): <span className="font-mono">₹{parseFloat(invoice.tax_amount || 0).toFixed(2)}</span></p>
-                <p className="text-sm font-bold text-slate-900">
-                  Grand Total: <span className="font-mono">₹{parseFloat(invoice.grand_total || 0).toFixed(2)}</span>
-                </p>
+          {/* Section 3: Summary & Grand Total Card */}
+          <div className="flex justify-end pt-1">
+            <div className="w-72 bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-2 text-xs">
+              <div className="flex justify-between text-slate-600">
+                <span>Subtotal:</span>
+                <span className="font-mono font-semibold">{sym}{parseFloat(invoice.subtotal || 0).toFixed(2)}</span>
+              </div>
+              <div className="flex justify-between text-slate-600">
+                <span>Tax / Shipping:</span>
+                <span className="font-mono font-semibold">{sym}{parseFloat(invoice.tax_amount || 0).toFixed(2)}</span>
+              </div>
+              <div className="flex justify-between text-sm font-bold text-slate-900 border-t border-slate-200 pt-2">
+                <span>Grand Total:</span>
+                <span className="font-mono text-indigo-700 text-base">{sym}{parseFloat(invoice.grand_total || 0).toFixed(2)}</span>
               </div>
             </div>
           </div>
-        </div>
 
-        {/* RIGHT PANE: Extracted Data & Editable Fields */}
-        <div className="lg:col-span-7 bg-white rounded-2xl border border-slate-200 p-5 shadow-sm flex flex-col h-[750px]">
-          {/* Tabs Navigation */}
-          <div className="flex items-center justify-between pb-3 border-b border-slate-200">
-            <div className="flex space-x-2">
+          {/* Section 4: Integrated 3-Way PO & GRN Match (Embedded in this Workspace!) */}
+          <div className="border border-slate-200 rounded-xl p-4 bg-slate-50/60 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <GitCompare className="w-4 h-4 text-indigo-600" />
+                <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wide">
+                  3-Way PO & Delivery Cross Check
+                </h3>
+              </div>
+
               <button
-                onClick={() => setActiveTab('fields')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold ${
-                  activeTab === 'fields' ? 'bg-indigo-50 text-indigo-700 border border-indigo-200' : 'text-slate-500 hover:bg-slate-50'
-                }`}
+                onClick={() => openEditModal('po_id', invoice.po, 'Linked Purchase Order')}
+                className="text-xs text-indigo-600 hover:text-indigo-800 font-semibold flex items-center space-x-1"
               >
-                Extracted Fields ({items.length} items)
-              </button>
-              <button
-                onClick={() => setActiveTab('history')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center space-x-1 ${
-                  activeTab === 'history' ? 'bg-indigo-50 text-indigo-700 border border-indigo-200' : 'text-slate-500 hover:bg-slate-50'
-                }`}
-              >
-                <History className="w-3.5 h-3.5" />
-                <span>Audit Edit History ({changeLogs.length})</span>
+                <Edit3 className="w-3 h-3" />
+                <span>{invoice.po ? 'Change PO' : 'Link Purchase Order'}</span>
               </button>
             </div>
 
-            <span className="text-[11px] text-slate-500 font-semibold">
-              OCR Confidence: <span className="font-bold text-indigo-600">{confidencePct}%</span>
-            </span>
-          </div>
-
-          {/* TAB 1: Extracted Header & Line Items */}
-          {activeTab === 'fields' && (
-            <div className="flex-1 overflow-y-auto mt-4 space-y-4 pr-1">
-              {/* Header Fields Grid */}
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                  <div className="flex items-center justify-between text-slate-500 text-[10px] font-semibold">
-                    <span>INVOICE NUMBER</span>
-                    <button onClick={() => openEditModal('invoice_number', invoice.invoice_number)} className="text-indigo-600 hover:text-indigo-800">
-                      <Edit3 className="w-3 h-3" />
-                    </button>
+            {invoice.po ? (
+              <div className="bg-white rounded-lg p-3.5 border border-slate-200 space-y-2.5 text-xs">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <span className="text-slate-500 font-semibold text-[11px]">Linked PO Reference:</span>
+                    <p className="font-mono font-bold text-indigo-700 text-sm">{invoice.po_details?.po_number}</p>
                   </div>
-                  <p className="font-mono font-bold text-xs text-slate-900 mt-1">{invoice.invoice_number}</p>
-                </div>
-
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                  <div className="flex items-center justify-between text-slate-500 text-[10px] font-semibold">
-                    <span>INVOICE DATE</span>
-                    <button onClick={() => openEditModal('invoice_date', invoice.invoice_date)} className="text-indigo-600 hover:text-indigo-800">
-                      <Edit3 className="w-3 h-3" />
-                    </button>
-                  </div>
-                  <p className="font-bold text-xs text-slate-900 mt-1">{invoice.invoice_date || 'Missing'}</p>
-                </div>
-
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                  <div className="flex items-center justify-between text-slate-500 text-[10px] font-semibold">
-                    <span>PO REFERENCE</span>
-                    <button onClick={() => openEditModal('po_id', invoice.po)} className="text-indigo-600 hover:text-indigo-800">
-                      <Edit3 className="w-3 h-3" />
-                    </button>
-                  </div>
-                  <p className="font-mono font-bold text-xs text-indigo-700 mt-1">{invoice.po_details?.po_number || 'Unlinked'}</p>
-                </div>
-
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg col-span-2">
-                  <div className="flex items-center justify-between text-slate-500 text-[10px] font-semibold">
-                    <span>VENDOR NAME</span>
-                    <button onClick={() => openEditModal('vendor_id', invoice.vendor)} className="text-indigo-600 hover:text-indigo-800">
-                      <Edit3 className="w-3 h-3" />
-                    </button>
-                  </div>
-                  <p className="font-bold text-xs text-slate-900 mt-1">{invoice.vendor_details?.name || 'Unassigned Vendor'}</p>
-                  <p className="text-[10px] text-slate-400 font-mono">GSTIN: {invoice.vendor_details?.gstin || 'N/A'}</p>
-                </div>
-
-                <div className="p-3 bg-indigo-50/70 border border-indigo-200 rounded-lg">
-                  <span className="text-[10px] font-bold text-indigo-900 uppercase">GRAND TOTAL</span>
-                  <p className="text-base font-bold text-indigo-950 mt-1">
-                    ₹{parseFloat(invoice.grand_total || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}
-                  </p>
-                </div>
-              </div>
-
-              {/* Line Items Table */}
-              <div>
-                <h4 className="text-xs font-bold text-slate-700 uppercase mb-2">
-                  Line Items & Materials ({items.length})
-                </h4>
-                <div className="border border-slate-200 rounded-xl overflow-hidden shadow-sm">
-                  <table className="w-full text-left text-xs">
-                    <thead className="bg-slate-50 border-b border-slate-200 text-slate-600">
-                      <tr>
-                        <th className="py-2.5 px-3 font-semibold">Description</th>
-                        <th className="py-2.5 px-3 font-semibold text-center">Quantity</th>
-                        <th className="py-2.5 px-3 font-semibold text-right">Unit Price</th>
-                        <th className="py-2.5 px-3 font-semibold text-center">GST %</th>
-                        <th className="py-2.5 px-3 font-semibold text-right">Line Total</th>
-                        <th className="py-2.5 px-3 text-center">Edit</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {items.map((item) => (
-                        <tr key={item.id} className="hover:bg-slate-50">
-                          <td className="py-2.5 px-3 font-medium text-slate-900">{item.description}</td>
-                          <td className="py-2.5 px-3 font-mono font-bold text-center">{parseFloat(item.quantity || 0)} {item.uom}</td>
-                          <td className="py-2.5 px-3 font-mono text-right">₹{parseFloat(item.unit_price || 0).toFixed(2)}</td>
-                          <td className="py-2.5 px-3 font-mono text-center">{parseFloat(item.tax_rate_percent || 0)}%</td>
-                          <td className="py-2.5 px-3 font-mono font-bold text-right">₹{parseFloat(item.line_total || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
-                          <td className="py-2.5 px-3 text-center">
-                            <button
-                              onClick={() => openEditModal('quantity', item.quantity, item.id)}
-                              className="text-indigo-600 hover:text-indigo-800 p-1 rounded hover:bg-indigo-50"
-                              title="Edit Quantity (Sensitive)"
-                            >
-                              <Edit3 className="w-3.5 h-3.5" />
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* TAB 2: Immutable Edit Audit History (Templegate Section 2.3) */}
-          {activeTab === 'history' && (
-            <div className="flex-1 overflow-y-auto mt-4 space-y-3 pr-1">
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-600">
-                <span className="font-bold text-slate-900">Templegate Audit Trail Rule 3:</span> Every edit records user, timestamp, field, old value, new value, and mandatory reason.
-              </div>
-
-              {changeLogs.length === 0 ? (
-                <div className="text-center py-12 text-slate-400 text-xs">
-                  No manual edits performed on this invoice yet.
-                </div>
-              ) : (
-                changeLogs.map((log) => (
-                  <div key={log.id} className="p-3 rounded-lg border border-slate-200 bg-white space-y-1.5 shadow-sm text-xs">
-                    <div className="flex items-center justify-between">
-                      <span className="font-bold text-slate-900">{log.field_name}</span>
-                      {log.is_sensitive && (
-                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-300">
-                          SENSITIVE CHANGE
+                  <div>
+                    <span className="text-slate-500 font-semibold text-[11px]">Match Status:</span>
+                    <div className="mt-0.5">
+                      {matchingResult?.status === 'MATCH_PASSED' ? (
+                        <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center space-x-1">
+                          <CheckCircle2 className="w-3 h-3" />
+                          <span>3-Way Match Passed (Zero Variance)</span>
+                        </span>
+                      ) : (
+                        <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-50 text-amber-700 border border-amber-200 flex items-center space-x-1">
+                          <AlertTriangle className="w-3 h-3" />
+                          <span>Match Evaluation: {matchingResult?.status || 'Pending Verification'}</span>
                         </span>
                       )}
                     </div>
-                    <div className="flex items-center space-x-2 font-mono text-[11px]">
-                      <span className="text-rose-600 line-through">Old: {log.old_value || 'None'}</span>
-                      <span className="text-slate-400">→</span>
-                      <span className="text-emerald-700 font-bold">New: {log.new_value}</span>
-                    </div>
-                    <p className="text-slate-600 italic">"Reason: {log.reason}"</p>
-                    <div className="text-[10px] text-slate-400 flex items-center justify-between pt-1 border-t border-slate-100">
-                      <span>Edited by: {log.user_display}</span>
-                      <span>{new Date(log.created_at).toLocaleString()}</span>
-                    </div>
                   </div>
-                ))
-              )}
-            </div>
-          )}
+                </div>
+
+                {matchingResult?.item_matching_details && (
+                  <div className="pt-2 border-t border-slate-100">
+                    <table className="w-full text-left text-[11px]">
+                      <thead>
+                        <tr className="text-slate-500 border-b pb-1 text-[10px]">
+                          <th>Item</th>
+                          <th className="text-center">PO Qty</th>
+                          <th className="text-center">Delivered (GRN)</th>
+                          <th className="text-center">Billed Qty</th>
+                          <th className="text-right">Variance</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {matchingResult.item_matching_details.map((m, idx) => (
+                          <tr key={idx} className="border-b border-slate-50">
+                            <td className="py-1 font-medium">{m.description}</td>
+                            <td className="py-1 text-center font-mono">{m.po_qty}</td>
+                            <td className="py-1 text-center font-mono text-indigo-600 font-bold">{m.grn_accepted_qty}</td>
+                            <td className="py-1 text-center font-mono font-bold">{m.invoice_qty}</td>
+                            <td className="py-1 text-right font-mono">
+                              <span className={m.variance_pct > 0 ? 'text-rose-600 font-bold' : 'text-emerald-600'}>
+                                {m.variance_pct > 0 ? `+${m.variance_pct}%` : '0.0%'}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {matchingResult?.status && matchingResult.status !== 'MATCH_PASSED' && (
+                  <div className="pt-2 flex justify-end">
+                    <button
+                      onClick={() => setShowOverrideModal(true)}
+                      className="px-3 py-1.5 text-xs font-bold text-amber-800 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-lg shadow-sm"
+                    >
+                      Authorize Discrepancy (Manager Override)
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="bg-white rounded-lg p-3 text-xs text-slate-500 border border-dashed border-slate-300 flex items-center justify-between">
+                <span>No Purchase Order linked to this invoice. Direct bill without 2-way/3-way verification.</span>
+                <button
+                  onClick={() => openEditModal('po_id', null, 'Link Purchase Order')}
+                  className="px-2.5 py-1 text-xs font-bold text-indigo-600 hover:text-indigo-800 bg-indigo-50 rounded"
+                >
+                  + Link PO
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      {/* Edit Modal with Mandatory Reason Prompt */}
-      {editModal.open && (
-        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl p-6 max-w-md w-full shadow-xl space-y-4">
+      {/* Line Item Edit & Create Modal */}
+      {itemModal.open && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4 border border-slate-200">
             <div className="flex items-center justify-between border-b pb-3">
               <h3 className="text-sm font-bold text-slate-900">
-                Edit Field: <span className="text-indigo-600">{editModal.field_name}</span>
+                {itemModal.isNew ? 'Add New Line Item' : 'Edit Line Item'}
               </h3>
-              <button onClick={() => setEditModal({ open: false, field_name: '', old_value: '', item_id: null })} className="text-slate-400 hover:text-slate-600">
+              <button
+                onClick={() => setItemModal({ open: false, isNew: false, item_id: null, description: '', quantity: '1.000', unit_price: '0.00' })}
+                className="text-slate-400 hover:text-slate-600 text-sm"
+              >
                 ✕
               </button>
             </div>
 
-            {isSensitiveField && (
-              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800 flex items-start space-x-2">
-                <ShieldAlert className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
-                <p>
-                  <b>Sensitive Financial Change:</b> Changing this field triggers an audit log and locks the invoice for AP Specialist Review before approval.
-                </p>
-              </div>
-            )}
-
-            <form onSubmit={handleSaveEdit} className="space-y-3">
+            <form onSubmit={handleSaveItem} className="space-y-3">
               <div>
-                <label className="text-xs font-semibold text-slate-700 block mb-1">New Value</label>
-                <input
-                  type="text"
+                <label className="text-xs font-semibold text-slate-700 block mb-1">
+                  Item Description & SKU <span className="text-rose-500">*</span>
+                </label>
+                <textarea
                   required
-                  value={editValue}
-                  onChange={(e) => setEditValue(e.target.value)}
-                  className="w-full text-xs p-2.5 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  rows={2}
+                  placeholder="e.g. EcoTones Memo Sheets - Paper, Office Supplies, OFF-PA-4014"
+                  value={itemModal.description}
+                  onChange={(e) => setItemModal({ ...itemModal, description: e.target.value })}
+                  className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 font-medium"
                 />
               </div>
 
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 block mb-1">Quantity</label>
+                  <input
+                    type="number"
+                    step="0.001"
+                    min="0.001"
+                    required
+                    value={itemModal.quantity}
+                    onChange={(e) => setItemModal({ ...itemModal, quantity: e.target.value })}
+                    className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono font-bold"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 block mb-1">Rate ({sym})</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    required
+                    value={itemModal.unit_price}
+                    onChange={(e) => setItemModal({ ...itemModal, unit_price: e.target.value })}
+                    className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono font-bold"
+                  />
+                </div>
+              </div>
+
+              <div className="bg-indigo-50/70 p-3 rounded-lg border border-indigo-100 flex justify-between items-center text-xs">
+                <span className="font-semibold text-indigo-950">Line Total:</span>
+                <span className="font-mono font-bold text-indigo-700 text-sm">
+                  {sym}{(parseFloat(itemModal.quantity || 0) * parseFloat(itemModal.unit_price || 0)).toFixed(2)}
+                </span>
+              </div>
+
+              <div className="flex justify-end space-x-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setItemModal({ open: false, isNew: false, item_id: null, description: '', quantity: '1.000', unit_price: '0.00' })}
+                  className="px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={submittingItem}
+                  className="px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm disabled:opacity-50"
+                >
+                  {submittingItem ? 'Saving...' : 'Save Line Item'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* General Header Edit Modal (Vendor, Currency, Dates, PO) */}
+      {editModal.open && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4 border border-slate-200">
+            <div className="flex items-center justify-between border-b pb-3">
+              <h3 className="text-sm font-bold text-slate-900">
+                Edit: <span className="text-indigo-600">{editModal.label}</span>
+              </h3>
+              <button
+                onClick={() => setEditModal({ open: false, field_name: '', old_value: '', label: '' })}
+                className="text-slate-400 hover:text-slate-600 text-sm"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEdit} className="space-y-4">
+              {/* Field 1: Currency Selector */}
+              {editModal.field_name === 'currency' ? (
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 block mb-1">Select Currency</label>
+                  <select
+                    value={editValue}
+                    onChange={(e) => setEditValue(e.target.value)}
+                    className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 font-bold"
+                  >
+                    <option value="USD">USD ($) — US Dollar</option>
+                    <option value="INR">INR (₹) — Indian Rupee</option>
+                    <option value="EUR">EUR (€) — Euro</option>
+                    <option value="GBP">GBP (£) — British Pound</option>
+                  </select>
+                </div>
+              ) : editModal.field_name === 'vendor_id' ? (
+                /* Field 2: Vendor Selector */
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 block mb-1">Choose Supplier / Vendor</label>
+                  <select
+                    value={vendors.some(v => v.id === editValue) ? editValue : (editValue ? 'CUSTOM' : '')}
+                    onChange={(e) => {
+                      if (e.target.value !== 'CUSTOM') {
+                        setEditValue(e.target.value);
+                      } else {
+                        setEditValue('');
+                      }
+                    }}
+                    className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg mb-2 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-medium"
+                  >
+                    <option value="">-- Select Existing Supplier --</option>
+                    {vendors.map((v) => (
+                      <option key={v.id} value={v.id}>{v.name} ({v.vendor_code})</option>
+                    ))}
+                    <option value="CUSTOM">➕ Type Custom Vendor Name...</option>
+                  </select>
+                  {!vendors.some(v => v.id === editValue) && (
+                    <input
+                      type="text"
+                      placeholder="Type supplier name (e.g. SuperStore)..."
+                      value={editValue}
+                      onChange={(e) => setEditValue(e.target.value)}
+                      className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 font-semibold"
+                    />
+                  )}
+                </div>
+              ) : editModal.field_name === 'po_id' ? (
+                /* Field 3: PO Selector */
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 block mb-1">Select Purchase Order to Link</label>
+                  <select
+                    value={editValue || ''}
+                    onChange={(e) => setEditValue(e.target.value)}
+                    className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 font-medium"
+                  >
+                    <option value="">-- No PO / Unlinked Direct Bill --</option>
+                    {purchaseOrders.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.po_number} ({p.vendor_details?.name || 'Vendor'} - {sym}{p.total_amount})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                /* Field 4: Standard Value */
+                <div>
+                  <label className="text-xs font-semibold text-slate-700 block mb-1">New Value</label>
+                  <input
+                    type="text"
+                    required
+                    value={editValue}
+                    onChange={(e) => setEditValue(e.target.value)}
+                    className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500 font-semibold"
+                  />
+                </div>
+              )}
+
               <div>
                 <label className="text-xs font-semibold text-slate-700 block mb-1">
-                  Mandatory Explanation Reason <span className="text-rose-500">*</span>
+                  Explanation / Reason <span className="text-rose-500">*</span>
                 </label>
                 <textarea
                   required
                   rows={3}
-                  placeholder="Explain why this value is being corrected (e.g. OCR misread INV-108 as 1NV-108, or packing list discrepancy)..."
+                  placeholder="State the reason for this edit..."
                   value={editReason}
                   onChange={(e) => setEditReason(e.target.value)}
-                  className="w-full text-xs p-2.5 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500"
                 />
               </div>
 
               <div className="flex justify-end space-x-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setEditModal({ open: false, field_name: '', old_value: '', item_id: null })}
+                  onClick={() => setEditModal({ open: false, field_name: '', old_value: '', label: '' })}
                   className="px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
                 >
                   Cancel
@@ -565,10 +957,82 @@ export default function OCRReview({ invoiceId, onBackToList, onNavigateToMatchin
                   disabled={submittingEdit}
                   className="px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm disabled:opacity-50"
                 >
-                  {submittingEdit ? 'Saving...' : 'Confirm & Log Edit'}
+                  {submittingEdit ? 'Saving...' : 'Save & Update'}
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Override Modal */}
+      {showOverrideModal && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4 border border-slate-200">
+            <h3 className="text-sm font-bold text-slate-900">Authorize 3-Way Match Discrepancy</h3>
+            <p className="text-xs text-slate-500">
+              Provide an audit justification to accept variance between the Purchase Order and the Invoiced amounts.
+            </p>
+            <form onSubmit={handleOverrideMatch} className="space-y-3">
+              <textarea
+                required
+                rows={3}
+                placeholder="State the business justification for approving this variance..."
+                value={overrideReason}
+                onChange={(e) => setOverrideReason(e.target.value)}
+                className="w-full text-xs p-2.5 bg-slate-50 border border-slate-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+              <div className="flex justify-end space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setShowOverrideModal(false)}
+                  className="px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-1.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-lg shadow-sm"
+                >
+                  Confirm & Authorize
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Audit History Drawer / Modal */}
+      {showHistoryModal && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-6 max-w-lg w-full shadow-2xl space-y-4 border border-slate-200 max-h-[85vh] flex flex-col">
+            <div className="flex items-center justify-between border-b pb-3">
+              <h3 className="text-sm font-bold text-slate-900 flex items-center space-x-2">
+                <History className="w-4 h-4 text-indigo-600" />
+                <span>Audit Trail: Bill #{invoice.invoice_number}</span>
+              </h3>
+              <button onClick={() => setShowHistoryModal(false)} className="text-slate-400 hover:text-slate-600">✕</button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto space-y-3 pr-1 text-xs">
+              {changeLogs.map((log) => (
+                <div key={log.id} className="p-3 rounded-lg border border-slate-200 bg-slate-50 space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-slate-900">{log.field_name}</span>
+                    <span className="text-[10px] text-slate-400">{new Date(log.created_at).toLocaleString()}</span>
+                  </div>
+                  <div className="flex items-center space-x-2 font-mono text-[11px]">
+                    <span className="text-rose-600 line-through">Old: {log.old_value || 'None'}</span>
+                    <span className="text-slate-400">→</span>
+                    <span className="text-emerald-700 font-bold">New: {log.new_value}</span>
+                  </div>
+                  <p className="text-slate-600 italic">"{log.reason}"</p>
+                  <p className="text-[10px] text-slate-400 pt-1 border-t border-slate-200">
+                    By: {log.user_display || 'User'}
+                  </p>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}

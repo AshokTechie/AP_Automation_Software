@@ -111,15 +111,16 @@ class PaymentAdviceGenerator:
 
         # 3. Itemized Invoice Settlement Table
         inv = payment_request.invoice
+        curr = getattr(inv, 'currency', 'INR') or 'INR'
         settlement_data = [
-            ["Invoice #", "Invoice Date", "PO Reference", "Gross Amount", "TDS Deducted", "Net Paid (INR)"],
+            ["Invoice #", "Invoice Date", "PO Reference", f"Gross ({curr})", "TDS Deducted", f"Net Paid ({curr})"],
             [
                 inv.invoice_number,
                 str(inv.invoice_date or '-'),
                 inv.po.po_number if inv.po else "Non-PO",
-                f"INR {payment_request.gross_amount:,.2f}",
-                f"INR {payment_request.tds_amount:,.2f} ({payment_request.tds_rate_percent}%)",
-                f"INR {payment_request.net_payable_amount:,.2f}"
+                f"{curr} {payment_request.gross_amount:,.2f}",
+                f"{curr} {payment_request.tds_amount:,.2f} ({payment_request.tds_rate_percent}%)",
+                f"{curr} {payment_request.net_payable_amount:,.2f}"
             ]
         ]
 

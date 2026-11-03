@@ -107,6 +107,8 @@ TIME_ZONE = 'Asia/Kolkata'  # Standard Indian Standard Time for GST & statutory 
 USE_I18N = True
 USE_TZ = True
 
+X_FRAME_OPTIONS = 'SAMEORIGIN'
+
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
